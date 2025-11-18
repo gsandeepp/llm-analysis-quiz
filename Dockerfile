@@ -1,21 +1,17 @@
 FROM python:3.11-slim
 
-# Install system dependencies
+# Install minimal dependencies
 RUN apt-get update && apt-get install -y \
     wget \
-    curl \
-    gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright and browsers
-RUN playwright install chromium
-RUN playwright install-deps
+# Install Playwright with minimal setup
+RUN playwright install chromium --with-deps
 
 COPY main.py .
 
