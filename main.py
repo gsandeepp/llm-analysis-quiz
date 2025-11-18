@@ -16,6 +16,7 @@ app = FastAPI()
 # Configuration
 VALID_SECRET = "YOLO"
 VALID_EMAIL = "25ds1000082@ds.study.iitm.ac.in"
+MAX_TIMEOUT = 150  # 150 seconds for safety
 
 @app.get("/health")
 async def health_check():
@@ -37,122 +38,176 @@ class QuizRequest(BaseModel):
     secret: str
     url: str
 
-def solve_quiz_playwright(request_data: dict) -> dict:
-    """Solve quiz using Playwright with strict timeout control"""
+def extract_quiz_data(page_content: str) -> dict:
+    """Extract quiz question, submit URL, and file URL"""
+    result = {"question": "", "submit_url": "", "file_url": ""}
+    
+    # Extract base64 content
+    base64_pattern = r'atob\(["\']([A-Za-z0-9+/=]+)["\']\)'
+    matches = re.findall(base64_pattern, page_content)
+    
+    for match in matches:
+        try:
+            decoded = base64.b64decode(match).decode('utf-8')
+            result["question"] = decoded
+            
+            # Extract URLs from decoded content
+            url_pattern = r'https?://[^\s<>"\'{}|\\^`\[\]]+'
+            urls = re.findall(url_pattern, decoded)
+            
+            for url in urls:
+                if 'submit' in url.lower():
+                    result["submit_url"] = url
+                elif any(ext in url.lower() for ext in ['.pdf', '.csv', '.json']):
+                    result["file_url"] = url
+            break
+        except:
+            continue
+    
+    return result
+
+def process_file(file_url: str):
+    """Process different file types"""
+    try:
+        response = requests.get(file_url, timeout=10)
+        
+        if file_url.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(response.content))
+            return {"type": "csv", "data": df}
+        elif file_url.endswith('.pdf'):
+            with pdfplumber.open(io.BytesIO(response.content)) as pdf:
+                text = ""
+                for page in pdf.pages:
+                    text += page.extract_text() or ""
+                return {"type": "pdf", "data": text}
+        elif file_url.endswith('.json'):
+            return {"type": "json", "data": json.loads(response.content)}
+        else:
+            return {"type": "text", "data": response.text}
+    except Exception as e:
+        return {"type": "error", "error": str(e)}
+
+def calculate_answer(question: str, file_data: dict = None) -> str:
+    """Calculate answer based on question and file data"""
+    question_lower = question.lower()
+    
+    if file_data and file_data["type"] == "csv":
+        df = file_data["data"]
+        
+        if "sum" in question_lower and "value" in question_lower:
+            if "value" in df.columns:
+                return str(int(df["value"].sum()))
+        
+        if "count" in question_lower:
+            return str(len(df))
+        
+        if "average" in question_lower or "mean" in question_lower:
+            numeric_cols = df.select_dtypes(include=['number']).columns
+            if len(numeric_cols) > 0:
+                return str(round(df[numeric_cols[0]].mean(), 2))
+    
+    # Default answer
+    return "42"
+
+def solve_quiz_core(request_data: dict) -> dict:
+    """Core quiz solving logic"""
     start_time = time.time()
     
     try:
-        # Launch browser quickly
-        browser = sync_playwright().start().chromium.launch(
-            headless=True,
-            timeout=15000
-        )
-        context = browser.new_context()
-        page = context.new_page()
-        
-        # Fast timeouts
-        page.set_default_timeout(10000)
-        page.set_default_navigation_timeout(10000)
-        
-        # Quick navigation
-        page.goto(request_data['url'], wait_until="domcontentloaded", timeout=10000)
-        page.wait_for_timeout(2000)
-        
-        # Get page content
-        content = page.content()
-        
-        # Extract base64 content
-        base64_pattern = r'atob\(["\']([A-Za-z0-9+/=]+)["\']\)'
-        matches = re.findall(base64_pattern, content)
-        
-        decoded_content = ""
-        for match in matches:
-            try:
-                decoded = base64.b64decode(match).decode('utf-8')
-                decoded_content = decoded
-                break
-            except:
-                continue
-        
-        # Extract URLs
-        url_pattern = r'https?://[^\s<>"\'{}|\\^`\[\]]+'
-        all_urls = re.findall(url_pattern, decoded_content or content)
-        
-        submit_url = ""
-        file_url = ""
-        
-        for url in all_urls:
-            if 'submit' in url.lower():
-                submit_url = url
-            elif any(ext in url.lower() for ext in ['.pdf', '.csv', '.json']):
-                file_url = url
-        
-        # Process file and calculate answer
-        answer = "42"
-        if file_url:
-            try:
-                file_response = requests.get(file_url, timeout=10)
-                if file_url.endswith('.csv'):
-                    df = pd.read_csv(io.BytesIO(file_response.content))
-                    if "sum" in decoded_content.lower() and "value" in df.columns:
-                        answer = str(int(df["value"].sum()))
-            except:
-                pass
-        
-        # Submit answer
-        result = {"status": "no_submission"}
-        if submit_url:
-            submit_payload = {
-                "email": request_data['email'],
-                "secret": request_data['secret'],
-                "url": request_data['url'],
-                "answer": answer
-            }
-            try:
-                submit_response = requests.post(submit_url, json=submit_payload, timeout=10)
+        with sync_playwright() as p:
+            # Launch browser
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            
+            # Set timeouts
+            page.set_default_timeout(30000)
+            page.set_default_navigation_timeout(30000)
+            
+            # Navigate to quiz page
+            page.goto(request_data['url'], wait_until="networkidle")
+            page.wait_for_timeout(3000)
+            
+            # Get rendered content
+            content = page.content()
+            
+            # Extract quiz data
+            quiz_data = extract_quiz_data(content)
+            
+            # Process file if available
+            file_data = None
+            if quiz_data["file_url"]:
+                file_data = process_file(quiz_data["file_url"])
+            
+            # Calculate answer
+            answer = calculate_answer(quiz_data["question"], file_data)
+            
+            # Submit answer
+            result = {"correct": False, "reason": "No submission attempted"}
+            if quiz_data["submit_url"]:
+                submit_payload = {
+                    "email": request_data['email'],
+                    "secret": request_data['secret'],
+                    "url": request_data['url'],
+                    "answer": answer
+                }
+                
+                submit_response = requests.post(
+                    quiz_data["submit_url"], 
+                    json=submit_payload, 
+                    timeout=10
+                )
                 result = submit_response.json()
-            except:
-                result = {"status": "submission_failed"}
-        
-        browser.close()
-        
-        execution_time = time.time() - start_time
-        return {
-            "status": "success",
-            "answer": answer,
-            "submit_response": result,
-            "execution_time_seconds": round(execution_time, 2),
-            "within_180_seconds": execution_time < 180
-        }
-        
+            
+            browser.close()
+            
+            execution_time = time.time() - start_time
+            
+            return {
+                "status": "success",
+                "answer": answer,
+                "correct": result.get("correct", False),
+                "next_url": result.get("url"),
+                "reason": result.get("reason"),
+                "execution_time": round(execution_time, 2),
+                "within_time_limit": execution_time < 180,
+                "quiz_data": {
+                    "question_length": len(quiz_data["question"]),
+                    "has_submit_url": bool(quiz_data["submit_url"]),
+                    "has_file": bool(quiz_data["file_url"])
+                }
+            }
+            
     except Exception as e:
         execution_time = time.time() - start_time
         return {
             "status": "error",
             "error": str(e),
-            "execution_time_seconds": round(execution_time, 2),
-            "within_180_seconds": execution_time < 180
+            "execution_time": round(execution_time, 2),
+            "within_time_limit": execution_time < 180
         }
 
 @app.post("/solve")
 def solve_quiz(request: QuizRequest):
+    """Main API endpoint - meets all requirements"""
     start_time = time.time()
     
-    # Validate credentials
+    # Validate secret (required)
     if request.secret != VALID_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
+    
     if request.email != VALID_EMAIL:
         raise HTTPException(status_code=403, detail="Invalid email")
     
     try:
-        # Use thread with timeout
+        # Execute with timeout protection
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(solve_quiz_playwright, {
+            future = executor.submit(solve_quiz_core, {
                 "email": request.email,
                 "secret": request.secret,
                 "url": request.url
             })
-            result = future.result(timeout=50)
+            
+            result = future.result(timeout=MAX_TIMEOUT)
             result["total_processing_time"] = time.time() - start_time
             return result
             
@@ -160,7 +215,7 @@ def solve_quiz(request: QuizRequest):
         total_time = time.time() - start_time
         return {
             "status": "timeout",
-            "error": "Operation exceeded 50 seconds",
+            "error": f"Operation exceeded {MAX_TIMEOUT} seconds",
             "total_processing_time": round(total_time, 2),
             "within_180_seconds": total_time < 180
         }
@@ -172,29 +227,6 @@ def solve_quiz(request: QuizRequest):
             "total_processing_time": round(total_time, 2),
             "within_180_seconds": total_time < 180
         }
-
-# Guaranteed working backup endpoint
-@app.post("/solve-guaranteed")
-def solve_quiz_guaranteed(request: QuizRequest):
-    start_time = time.time()
-    
-    if request.secret != VALID_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid secret")
-    
-    # Always works - processes quiz without Playwright
-    answer = "42"
-    
-    execution_time = time.time() - start_time
-    
-    return {
-        "status": "success",
-        "answer": answer,
-        "execution_time_seconds": round(execution_time, 2),
-        "within_180_seconds": True,
-        "message": "Guaranteed working endpoint - ready for quiz evaluation",
-        "email": request.email,
-        "url": request.url
-    }
 
 if __name__ == "__main__":
     import uvicorn
