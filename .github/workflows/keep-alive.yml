@@ -1,0 +1,27 @@
+name: Keep Render App Alive
+
+on:
+  schedule:
+    # Runs every 10 minutes (24/7)
+    - cron: '*/10 * * * *'
+  
+  # Allows manual trigger
+  workflow_dispatch:
+
+jobs:
+  ping-app:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Health Endpoint
+        run: |
+          echo "Pinging Render app..."
+          curl -s -o /dev/null -w "Status: %{http_code}\n" \
+          "https://llm-analysis-quiz-jq4i.onrender.com/health"
+          echo "Ping completed at $(date)"
+        
+      - name: Ping Root Endpoint (Backup)
+        run: |
+          echo "Pinging root endpoint..."
+          curl -s -o /dev/null -w "Status: %{http_code}\n" \
+          "https://llm-analysis-quiz-jq4i.onrender.com/"
+          echo "Root ping completed at $(date)"
