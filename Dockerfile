@@ -1,9 +1,8 @@
 FROM python:3.11-slim
 
-# Install only essential dependencies
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     wget \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -11,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright with its own Chromium (no system Chrome needed)
+# Install Playwright
 RUN playwright install chromium
 
 COPY main.py .
